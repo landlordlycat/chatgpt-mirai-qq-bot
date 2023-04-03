@@ -1,73 +1,146 @@
+import os, sys
+sys.path.append(os.getcwd())
+
+import utils.exithooks
+from io import BytesIO
+from typing import Union
+from typing_extensions import Annotated
 from graia.ariadne.app import Ariadne
 from graia.ariadne.connection.config import (
     HttpClientConfig,
     WebsocketClientConfig,
-    config,
+    config as ariadne_config,
 )
+from graia.ariadne.message import Source
 from graia.ariadne.message.chain import MessageChain
-from graia.ariadne.message.parser.base import MentionMe
-from graia.ariadne.message.element import Plain, Image
-from graia.ariadne.model import Friend, Group, Member
+from graia.ariadne.message.parser.base import DetectPrefix, MentionMe
+from graia.ariadne.event.mirai import NewFriendRequestEvent, BotInvitedJoinGroupRequestEvent
+from graia.ariadne.message.element import Image
+from graia.ariadne.event.lifecycle import AccountLaunch
+from graia.ariadne.model import Friend, Group
+from loguru import logger
+
+import re
+import asyncio
 import chatbot
-import asyncio, functools
-import contextvars
-import json
+from config import Config
 from text_to_img import text_to_image
-from io import BytesIO
 
-# Polyfill for Python < 3.9
-async def to_thread(func, /, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    ctx = contextvars.copy_context()
-    func_call = functools.partial(ctx.run, func, *args, **kwargs)
-    return await loop.run_in_executor(None, func_call)
-if not hasattr(asyncio, 'to_thread'):
-    asyncio.to_thread = to_thread
-with open("config.json", "r") as jsonfile:
-    config_data = json.load(jsonfile)
 
+config = Config.load_config()
 # Refer to https://graia.readthedocs.io/ariadne/quickstart/
 app = Ariadne(
-    config(
-        config_data["mirai"]["qq"],  # 你的机器人的 qq 号
-        config_data["mirai"]["api_key"],  # 填入 VerifyKey
-        HttpClientConfig(host=config_data["mirai"]["http_url"]),
-        WebsocketClientConfig(host=config_data["mirai"]["ws_url"]),
+    ariadne_config(
+        config.mirai.qq,  # 配置详见
+        config.mirai.api_key,
+        HttpClientConfig(host=config.mirai.http_url),
+        WebsocketClientConfig(host=config.mirai.ws_url),
     ),
 )
 
-def handle_message(id, message):
-    if message.strip() == '':
-        return "您好！我是 Assistant，一个由 OpenAI 训练的大型语言模型。我不是真正的人，而是一个计算机程序，可以通过文本聊天来帮助您解决问题。如果您有任何问题，请随时告诉我，我将尽力回答。\n如果您需要重置我们的会话，请回复`重置会话`。"
-    bot = chatbot.bot
-    session = chatbot.get_chat_session(id)
-    if message.strip() == '重置会话':
-        session.reset_conversation()
-        return "会话已重置。"
-    try:
-        resp = session.get_chat_response(message)
-        print(id, resp)
-        return resp["message"]
-    except Exception as e:
-        # session.reset_conversation()
-        bot.refresh_session()
-        return '出现故障！如果这个问题持续出现，请和我说“重置会话”。\n' + str(e)
+async def create_timeout_task(target: Union[Friend, Group], source: Source):
+    await asyncio.sleep(config.response.timeout)
+    await app.send_message(target, config.response.timeout_format, quote=source if config.response.quote else False)
+
+async def handle_message(target: Union[Friend, Group], session_id: str, message: str, source: Source) -> str:
+    if not message.strip():
+        return config.response.placeholder
+    
+    timeout_task = None
+
+    session = chatbot.get_chat_session(session_id)
+    
+    # 回滚
+    if message.strip() in config.trigger.rollback_command:
+        resp = session.rollback_conversation()
+        if resp:
+            return config.response.rollback_success + '\n' + resp
+        return config.response.rollback_fail
+
+    # 队列满时拒绝新的消息
+    if config.response.max_queue_size > 0 and session.chatbot.queue_size > config.response.max_queue_size:
+        return config.response.queue_full
+    else:
+        # 提示用户：请求已加入队列
+        if session.chatbot.queue_size > config.response.queued_notice_size:
+            await app.send_message(target, config.response.queued_notice.format(queue_size=session.chatbot.queue_size), quote=source if config.response.quote else False)
+
+    # 以下开始需要排队
+    
+    async with session.chatbot:
+        try:
+
+            timeout_task = asyncio.create_task(create_timeout_task(target, source))
+
+            # 重置会话
+            if message.strip() in config.trigger.reset_command:
+                session.reset_conversation()
+                await chatbot.initial_process(session)
+                return config.response.reset
+
+            # # 新会话
+            # if is_new_session:
+            #     await chatbot.initial_process(session)
+
+            # 加载关键词人设
+            preset_search = re.search(config.presets.command, message)
+            if preset_search:
+                async for progress in session.load_conversation(preset_search.group(1)):
+                    await app.send_message(target, progress, quote=source if config.response.quote else False)
+                return config.presets.loaded_successful
+            # 正常交流
+            resp = await session.get_chat_response(message)
+            if resp:
+                logger.debug(f"{session_id} - {session.chatbot.id} {resp}")
+                return resp.strip()
+        except Exception as e:
+            if str(e)  == "('Response code error: ', 429)" or 'overloaded' in str(e):
+                return config.response.request_too_fast
+            logger.exception(e)
+            return config.response.error_format.format(exc=e)
+        finally:
+            if timeout_task:
+                timeout_task.cancel()
+    ### 排队结束
+
 
 @app.broadcast.receiver("FriendMessage")
-async def friend_message_listener(app: Ariadne, friend: Friend, chain: MessageChain):
-    if friend.id == config_data['mirai']['qq']:
+async def friend_message_listener(app: Ariadne, friend: Friend, source: Source, chain: Annotated[MessageChain, DetectPrefix(config.trigger.prefix)]):
+    if friend.id == config.mirai.qq:
         return
-    response = await asyncio.to_thread(handle_message, id=f"friend-{friend.id}", message=chain.display)
-    await app.send_message(friend, response)
+    response = await handle_message(friend, f"friend-{friend.id}", chain.display, source)
+    await app.send_message(friend, response, quote=source if config.response.quote else False)
 
-@app.broadcast.receiver("GroupMessage", decorators=[MentionMe()])
-async def on_mention_me(group: Group, member: Member, chain: MessageChain = MentionMe()):
-    response = await asyncio.to_thread(handle_message, id=f"group-{group.id}", message=chain.display)
-    event = await app.send_message(group,  response)
-    if(event.source.id < 0):
+GroupTrigger = Annotated[MessageChain, MentionMe(config.trigger.require_mention != "at"), DetectPrefix(config.trigger.prefix)] if config.trigger.require_mention != "none" else Annotated[MessageChain, DetectPrefix(config.trigger.prefix)]
+
+@app.broadcast.receiver("GroupMessage")
+async def group_message_listener(group: Group, source: Source, chain: GroupTrigger):
+    response = await handle_message(group, f"group-{group.id}", chain.display, source)
+    event = await app.send_message(group, response)
+    if event.source.id < 0:
         img = text_to_image(text=response)
         b = BytesIO()
         img.save(b, format="png")
-        await app.send_message(group, Image(data_bytes=b.getvalue()))
+        await app.send_message(group, Image(data_bytes=b.getvalue()), quote=source if config.response.quote else False)
 
+@app.broadcast.receiver("NewFriendRequestEvent")
+async def on_friend_request(event: NewFriendRequestEvent):
+    if config.system.accept_friend_request:
+        await event.accept()
+
+@app.broadcast.receiver("BotInvitedJoinGroupRequestEvent")
+async def on_friend_request(event: BotInvitedJoinGroupRequestEvent):
+    if config.system.accept_group_invite:
+        await event.accept()
+
+@app.broadcast.receiver(AccountLaunch)
+async def start_background(loop: asyncio.AbstractEventLoop):
+    try:
+        logger.info("OpenAI 服务器登录中……")
+        chatbot.setup()
+    except Exception as e:
+        logger.error("OpenAI 服务器失败！")
+        exit(-1)
+    logger.info("OpenAI 服务器登录成功")
+    logger.info("尝试从 Mirai 服务中读取机器人 QQ 的 session key……")
 app.launch_blocking()
